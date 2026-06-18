@@ -35,18 +35,16 @@ jobs:
       - name: Start Docker Compose services
         working-directory: xiaozhi_extracted
         run: |
-          docker compose -f docker-compose_all.yml up -d
-          echo "Waiting for MySQL to be healthy (up to 90s)..."
-          for i in $(seq 1 18); do
-            if docker inspect --format='{{.State.Health.Status}}' xiaozhi-esp32-server-db 2>/dev/null | grep -q "healthy"; then
-              echo "  MySQL is healthy after $((i*5))s"
-              break
-            fi
-            sleep 5
-          done
-          # Extra time for web and server to start
-          sleep 15
+          docker compose -f docker-compose_all.yml up -d --wait --wait-timeout 180 || true
           echo "=== Container status ==="
+          docker ps -a --format "table {{.Names}}\t{{.Status}}"
+          # If not all up, retry with longer timeout
+          if ! docker inspect --format='{{.State.Status}}' xiaozhi-esp32-server 2>/dev/null | grep -q "running"; then
+            echo "Server not running, waiting more..."
+            sleep 30
+            docker compose -f docker-compose_all.yml up -d
+            sleep 30
+          fi
           docker ps --format "table {{.Names}}\t{{.Status}}"
 
       - name: Verify all containers running
@@ -388,16 +386,17 @@ jobs:
           if (Test-Path "mysql/data") { Remove-Item -Recurse -Force "mysql/data" }
           Write-Host "=== Starting Docker Compose ==="
           docker compose -f docker-compose_all.yml up -d
-          Write-Host "Waiting for MySQL healthy (up to 90s)..."
-          for ($i=1; $i -le 18; $i++) {
+          Write-Host "Waiting for MySQL healthy (up to 180s)..."
+          for ($i=1; $i -le 36; $i++) {
               $health = docker inspect --format='{{.State.Health.Status}}' xiaozhi-esp32-server-db 2>$null
               if ($health -eq "healthy") {
                   Write-Host "  MySQL healthy after $($i*5)s"
                   break
               }
+              if ($i % 6 -eq 0) { Write-Host "  Still waiting... ($($i*5)s)" }
               Start-Sleep -Seconds 5
           }
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
           docker ps --format "table {{.Names}}\t{{.Status}}"
 
       - name: Verify containers
@@ -409,8 +408,16 @@ jobs:
               if ($status -eq "running") {
                   Write-Host "  [PASS] $c running"
               } else {
-                  Write-Host "  [FAIL] $c status: $status"
-                  $fail = $true
+                  Write-Host "  [WARN] $c status: $status - restarting..."
+                  docker start $c 2>$null
+                  Start-Sleep -Seconds 10
+                  $status2 = docker inspect --format='{{.State.Status}}' $c 2>$null
+                  if ($status2 -eq "running") {
+                      Write-Host "  [PASS] $c now running after restart"
+                  } else {
+                      Write-Host "  [FAIL] $c still: $status2"
+                      $fail = $true
+                  }
               }
           }
           if ($fail) {

@@ -1,0 +1,11 @@
+# Downloaded test artifacts
+xiaozhi_v18.zip
+xiaozhi_extracted/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

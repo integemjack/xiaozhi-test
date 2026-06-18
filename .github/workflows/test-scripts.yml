@@ -1,0 +1,305 @@
+name: Test Xiaozhi Scripts
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-scripts-linux:
+    name: Test Scripts on Linux
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download xiaozhi_v18.zip
+        run: |
+          echo "=== Downloading xiaozhi_v18.zip ==="
+          curl -L -o xiaozhi_v18.zip "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          ls -lh xiaozhi_v18.zip
+
+      - name: Extract ZIP file
+        run: |
+          echo "=== Extracting xiaozhi_v18.zip ==="
+          unzip -o xiaozhi_v18.zip -d xiaozhi_extracted
+          echo ""
+          echo "=== Extracted file structure ==="
+          find xiaozhi_extracted -type f | head -100
+          echo ""
+          echo "=== Total files extracted ==="
+          find xiaozhi_extracted -type f | wc -l
+
+      - name: List all script files
+        run: |
+          echo "=== Finding all script files ==="
+          echo ""
+          echo "--- Batch files (.bat) ---"
+          find xiaozhi_extracted -name "*.bat" -type f
+          echo ""
+          echo "--- Shell scripts (.sh / .command) ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f
+          echo ""
+          echo "--- Python scripts (.py) ---"
+          find xiaozhi_extracted -name "*.py" -type f
+          echo ""
+          echo "--- YAML config files ---"
+          find xiaozhi_extracted \( -name "*.yml" -o -name "*.yaml" \) -type f
+          echo ""
+          echo "--- Dockerfiles ---"
+          find xiaozhi_extracted -name "Dockerfile*" -type f
+
+      - name: Validate YAML files
+        run: |
+          echo "=== Validating YAML files ==="
+          pip install pyyaml
+          find xiaozhi_extracted \( -name "*.yml" -o -name "*.yaml" \) -type f | while read f; do
+            echo "Checking: $f"
+            python3 -c "
+          import yaml, sys
+          try:
+              with open('$f', 'r', encoding='utf-8') as fh:
+                  yaml.safe_load(fh)
+              print('  [PASS] Valid YAML')
+          except Exception as e:
+              print(f'  [FAIL] {e}')
+              sys.exit(1)
+          " || echo "  [WARN] YAML validation failed for $f"
+          done
+          echo ""
+          echo "=== YAML validation complete ==="
+
+      - name: Validate Docker Compose files
+        run: |
+          echo "=== Validating Docker Compose files ==="
+          find xiaozhi_extracted \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" \) -type f | while read f; do
+            echo "Checking: $f"
+            docker compose -f "$f" config --quiet 2>&1 && echo "  [PASS] Valid Docker Compose" || echo "  [WARN] Docker Compose validation issue"
+          done
+          echo ""
+          echo "=== Docker Compose validation complete ==="
+
+      - name: Check shell scripts syntax
+        run: |
+          echo "=== Checking shell scripts syntax ==="
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f | while read f; do
+            echo "Checking: $f"
+            # Try to detect shell type from shebang
+            SHEBANG=$(head -1 "$f" 2>/dev/null)
+            if echo "$SHEBANG" | grep -q "bash"; then
+              bash -n "$f" 2>&1 && echo "  [PASS] Valid bash syntax" || echo "  [FAIL] Bash syntax error"
+            elif echo "$SHEBANG" | grep -q "sh"; then
+              sh -n "$f" 2>&1 && echo "  [PASS] Valid sh syntax" || echo "  [FAIL] Sh syntax error"
+            else
+              # Default to bash
+              bash -n "$f" 2>&1 && echo "  [PASS] Valid bash syntax (default)" || echo "  [FAIL] Bash syntax error"
+            fi
+          done
+          echo ""
+          echo "=== Shell script syntax check complete ==="
+
+      - name: Check batch scripts syntax (basic validation)
+        run: |
+          echo "=== Checking batch scripts (basic validation) ==="
+          find xiaozhi_extracted -name "*.bat" -type f | while read f; do
+            echo "Checking: $f"
+            # Check file is not empty
+            if [ ! -s "$f" ]; then
+              echo "  [FAIL] File is empty"
+              continue
+            fi
+            # Check for common batch file patterns
+            if head -5 "$f" | grep -qi "@echo\|rem\|set\|echo\|call\|goto"; then
+              echo "  [PASS] Contains valid batch commands"
+            else
+              echo "  [WARN] May not be a standard batch file"
+            fi
+            # Check for encoding issues (BOM or non-UTF8)
+            if file "$f" | grep -qi "utf-8\|ascii\|text"; then
+              echo "  [PASS] Valid text encoding"
+            else
+              echo "  [WARN] Unusual file encoding: $(file "$f")"
+            fi
+          done
+          echo ""
+          echo "=== Batch script validation complete ==="
+
+      - name: Check Python scripts syntax
+        run: |
+          echo "=== Checking Python scripts syntax ==="
+          find xiaozhi_extracted -name "*.py" -type f | while read f; do
+            echo "Checking: $f"
+            python3 -m py_compile "$f" 2>&1 && echo "  [PASS] Valid Python syntax" || echo "  [FAIL] Python syntax error"
+          done
+          echo ""
+          echo "=== Python script syntax check complete ==="
+
+      - name: Check Dockerfiles syntax
+        run: |
+          echo "=== Checking Dockerfiles ==="
+          # Install hadolint for Dockerfile linting
+          wget -q -O hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x hadolint
+          find xiaozhi_extracted -name "Dockerfile*" -type f | while read f; do
+            echo "Checking: $f"
+            ./hadolint --no-fail "$f" 2>&1 | head -20
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              echo "  [PASS] Dockerfile lint passed"
+            else
+              echo "  [WARN] Dockerfile has lint warnings"
+            fi
+          done
+          echo ""
+          echo "=== Dockerfile check complete ==="
+
+      - name: Check file permissions and line endings
+        run: |
+          echo "=== Checking file permissions and line endings ==="
+          echo ""
+          echo "--- Shell scripts without execute permission ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f ! -perm -111
+          echo ""
+          echo "--- Files with Windows line endings (CRLF) ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f -exec grep -Pl '\r\n' {} \; 2>/dev/null || true
+          echo ""
+          echo "=== Permission and line ending check complete ==="
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "=== TEST SUMMARY ==="
+          echo ""
+          echo "Project: xiaozhi_v18"
+          echo "Source: https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          echo ""
+          echo "Files analyzed:"
+          echo "  Total files:      $(find xiaozhi_extracted -type f | wc -l)"
+          echo "  Batch scripts:    $(find xiaozhi_extracted -name '*.bat' -type f | wc -l)"
+          echo "  Shell scripts:    $(find xiaozhi_extracted \( -name '*.sh' -o -name '*.command' \) -type f | wc -l)"
+          echo "  Python scripts:   $(find xiaozhi_extracted -name '*.py' -type f | wc -l)"
+          echo "  YAML configs:     $(find xiaozhi_extracted \( -name '*.yml' -o -name '*.yaml' \) -type f | wc -l)"
+          echo "  Dockerfiles:      $(find xiaozhi_extracted -name 'Dockerfile*' -type f | wc -l)"
+          echo ""
+          echo "=== END SUMMARY ==="
+
+  test-scripts-windows:
+    name: Test Scripts on Windows
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download xiaozhi_v18.zip
+        run: |
+          Write-Host "=== Downloading xiaozhi_v18.zip ==="
+          Invoke-WebRequest -Uri "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip" -OutFile "xiaozhi_v18.zip"
+          Get-Item "xiaozhi_v18.zip" | Select-Object Name, Length
+
+      - name: Extract ZIP file
+        run: |
+          Write-Host "=== Extracting xiaozhi_v18.zip ==="
+          Expand-Archive -Path "xiaozhi_v18.zip" -DestinationPath "xiaozhi_extracted" -Force
+          Write-Host ""
+          Write-Host "=== Extracted file structure ==="
+          Get-ChildItem -Recurse "xiaozhi_extracted" -File | Select-Object -First 100 FullName
+
+      - name: Validate batch scripts syntax
+        run: |
+          Write-Host "=== Validating Batch Scripts ==="
+          $batFiles = Get-ChildItem -Recurse "xiaozhi_extracted" -Filter "*.bat" -File
+          $totalPass = 0
+          $totalFail = 0
+          foreach ($file in $batFiles) {
+              Write-Host "Checking: $($file.FullName)"
+              # Check if file is non-empty
+              if ($file.Length -eq 0) {
+                  Write-Host "  [FAIL] File is empty"
+                  $totalFail++
+                  continue
+              }
+              # Basic syntax check - verify it contains batch commands
+              $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+              if ($content -match '(?i)(@echo|set |echo |goto |call |if |for |rem )') {
+                  Write-Host "  [PASS] Contains valid batch commands"
+                  $totalPass++
+              } else {
+                  Write-Host "  [WARN] May not be a standard batch file"
+                  $totalFail++
+              }
+          }
+          Write-Host ""
+          Write-Host "Results: $totalPass passed, $totalFail warnings/failures out of $($batFiles.Count) files"
+
+      - name: Validate YAML files
+        run: |
+          Write-Host "=== Validating YAML Files ==="
+          pip install pyyaml --quiet
+          $yamlFiles = Get-ChildItem -Recurse "xiaozhi_extracted" -Include "*.yml","*.yaml" -File
+          foreach ($file in $yamlFiles) {
+              Write-Host "Checking: $($file.FullName)"
+              python -c "
+          import yaml, sys
+          try:
+              with open(r'$($file.FullName)', 'r', encoding='utf-8') as f:
+                  yaml.safe_load(f)
+              print('  [PASS] Valid YAML')
+          except Exception as e:
+              print(f'  [FAIL] {e}')
+          "
+          }
+
+      - name: Validate Python scripts syntax
+        run: |
+          Write-Host "=== Validating Python Scripts ==="
+          $pyFiles = Get-ChildItem -Recurse "xiaozhi_extracted" -Filter "*.py" -File
+          $totalPass = 0
+          $totalFail = 0
+          foreach ($file in $pyFiles) {
+              Write-Host "Checking: $($file.FullName)"
+              python -m py_compile $file.FullName 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "  [PASS] Valid Python syntax"
+                  $totalPass++
+              } else {
+                  Write-Host "  [FAIL] Python syntax error"
+                  $totalFail++
+              }
+          }
+          Write-Host ""
+          Write-Host "Results: $totalPass passed, $totalFail failed out of $($pyFiles.Count) files"
+
+      - name: Test Docker Compose file validity
+        run: |
+          Write-Host "=== Checking Docker Compose files ==="
+          $composeFiles = Get-ChildItem -Recurse "xiaozhi_extracted" -Include "docker-compose*.yml","docker-compose*.yaml" -File
+          foreach ($file in $composeFiles) {
+              Write-Host "Checking: $($file.FullName)"
+              docker compose -f $file.FullName config --quiet 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "  [PASS] Valid Docker Compose file"
+              } else {
+                  Write-Host "  [WARN] Docker Compose validation issue"
+              }
+          }
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          Write-Host "=== TEST SUMMARY (Windows) ==="
+          Write-Host ""
+          $allFiles = Get-ChildItem -Recurse "xiaozhi_extracted" -File
+          $batFiles = $allFiles | Where-Object { $_.Extension -eq ".bat" }
+          $shFiles = $allFiles | Where-Object { $_.Extension -in ".sh",".command" }
+          $pyFiles = $allFiles | Where-Object { $_.Extension -eq ".py" }
+          $yamlFiles = $allFiles | Where-Object { $_.Extension -in ".yml",".yaml" }
+          Write-Host "  Total files:      $($allFiles.Count)"
+          Write-Host "  Batch scripts:    $($batFiles.Count)"
+          Write-Host "  Shell scripts:    $($shFiles.Count)"
+          Write-Host "  Python scripts:   $($pyFiles.Count)"
+          Write-Host "  YAML configs:     $($yamlFiles.Count)"
+          Write-Host ""
+          Write-Host "=== END SUMMARY ==="

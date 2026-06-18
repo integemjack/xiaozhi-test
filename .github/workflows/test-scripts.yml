@@ -30,7 +30,11 @@ jobs:
         run: |
           # Remove bundled mysql data to allow fresh initialization
           rm -rf mysql/data
-          echo "=== Cleaned mysql/data for fresh init ==="
+          # Use pre-built image instead of building from source
+          sed -i 's|#\s*image:.*xiaozhi-esp32-server:server_latest|image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
+          sed -i '/build:/,/dockerfile:.*/d' docker-compose_all.yml
+          echo "=== Modified docker-compose (server section) ==="
+          head -20 docker-compose_all.yml
 
       - name: Start Docker Compose services
         working-directory: xiaozhi_extracted
@@ -233,6 +237,9 @@ jobs:
         working-directory: xiaozhi_extracted
         run: |
           rm -rf mysql/data
+          # Use pre-built image instead of building from source
+          sed -i '' 's|#.*image:.*xiaozhi-esp32-server:server_latest|    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
+          sed -i '' '/build:/,/dockerfile:.*/d' docker-compose_all.yml
           docker compose -f docker-compose_all.yml up -d
           echo "Waiting for MySQL healthy (up to 120s)..."
           for i in $(seq 1 24); do
@@ -381,9 +388,15 @@ jobs:
 
       - name: Prepare and start services
         working-directory: xiaozhi_extracted
+        shell: bash
         run: |
-          Write-Host "=== Preparing environment ==="
-          if (Test-Path "mysql/data") { Remove-Item -Recurse -Force "mysql/data" }
+          rm -rf mysql/data
+          # Use pre-built image instead of building from source
+          sed -i 's|#\s*image:.*xiaozhi-esp32-server:server_latest|image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
+          sed -i '/build:/,/dockerfile:.*/d' docker-compose_all.yml
+      - name: Start services
+        working-directory: xiaozhi_extracted
+        run: |
           Write-Host "=== Starting Docker Compose ==="
           docker compose -f docker-compose_all.yml up -d
           Write-Host "Waiting for MySQL healthy (up to 180s)..."

@@ -229,10 +229,17 @@ jobs:
           echo "--- Dockerfiles ---"
           find xiaozhi_extracted -name "Dockerfile*" -type f
 
+      - name: Setup Python virtual environment
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install pyyaml
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+
       - name: Validate YAML files
         run: |
           echo "=== Validating YAML files ==="
-          pip3 install pyyaml
           find xiaozhi_extracted \( -name "*.yml" -o -name "*.yaml" \) -type f | while read f; do
             echo "Checking: $f"
             python3 -c "

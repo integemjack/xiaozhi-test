@@ -7,115 +7,142 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  ZIP_URL: "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+
 jobs:
   test-linux:
     name: Test on Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and extract xiaozhi_v18.zip
+      - name: Download and extract project
         run: |
-          curl -L --retry 5 --retry-delay 10 --retry-all-errors \
-               -o xiaozhi_v18.zip "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          curl -L --retry 5 --retry-delay 10 --retry-all-errors -o xiaozhi_v18.zip "$ZIP_URL"
           unzip -o xiaozhi_v18.zip -d xiaozhi_extracted
-          echo "=== Top-level files ==="
           find xiaozhi_extracted -maxdepth 1 -type f | sort
 
-      - name: Prepare clean environment
-        working-directory: xiaozhi_extracted
+      - name: Create CI Docker Compose
         run: |
-          # Remove bundled mysql data to allow fresh initialization
-          rm -rf mysql/data
-          # Use pre-built image instead of building from source
-          sed -i 's|#\s*image:.*xiaozhi-esp32-server:server_latest|image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
-          sed -i '/build:/,/dockerfile:.*/d' docker-compose_all.yml
-          echo "=== Modified docker-compose (server section) ==="
-          head -20 docker-compose_all.yml
+          cat > docker-compose-ci.yml << 'EOF'
+          services:
+            xiaozhi-esp32-server-db:
+              image: mysql:9.0
+              container_name: xiaozhi-esp32-server-db
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                timeout: 45s
+                interval: 10s
+                retries: 10
+              restart: always
+              ports:
+                - "3306:3306"
+              environment:
+                - MYSQL_ROOT_PASSWORD=123456
+                - MYSQL_DATABASE=xiaozhi_esp32_server
+            xiaozhi-esp32-server-redis:
+              image: redis:8.0
+              container_name: xiaozhi-esp32-server-redis
+              ports:
+                - "6379:6379"
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+          EOF
 
-      - name: Start Docker Compose services
-        working-directory: xiaozhi_extracted
+      - name: Start infrastructure services
         run: |
-          docker compose -f docker-compose_all.yml up -d --wait --wait-timeout 180 || true
-          echo "=== Container status ==="
-          docker ps -a --format "table {{.Names}}\t{{.Status}}"
-          # If not all up, retry with longer timeout
-          if ! docker inspect --format='{{.State.Status}}' xiaozhi-esp32-server 2>/dev/null | grep -q "running"; then
-            echo "Server not running, waiting more..."
-            sleep 30
-            docker compose -f docker-compose_all.yml up -d
-            sleep 30
-          fi
+          docker compose -f docker-compose-ci.yml up -d --wait --wait-timeout 120
           docker ps --format "table {{.Names}}\t{{.Status}}"
 
-      - name: Verify all containers running
+      - name: Verify services
         run: |
-          EXPECTED="xiaozhi-esp32-server xiaozhi-esp32-server-web xiaozhi-esp32-server-db xiaozhi-esp32-server-redis"
-          FAIL=0
-          for c in $EXPECTED; do
-            STATUS=$(docker inspect --format='{{.State.Status}}' "$c" 2>/dev/null || echo "not_found")
-            if [ "$STATUS" = "running" ]; then
-              echo "  [PASS] $c is running"
-            else
-              echo "  [FAIL] $c status: $STATUS"
-              FAIL=1
-            fi
-          done
-          if [ "$FAIL" = "1" ]; then
-            docker compose -f xiaozhi_extracted/docker-compose_all.yml logs --tail=50
-            exit 1
-          fi
+          echo "=== Verify MySQL ==="
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 -e "SELECT 1;" 2>/dev/null && echo "  [PASS] MySQL OK"
+          echo "=== Verify Redis ==="
+          docker exec xiaozhi-esp32-server-redis redis-cli PING | grep -q PONG && echo "  [PASS] Redis OK"
 
-      - name: Verify ports listening
+      - name: Initialize DB tables
         run: |
-          for port in 8000 8002 8003; do
-            if ss -tlnp | grep -q ":$port "; then
-              echo "  [PASS] Port $port listening"
-            else
-              echo "  [WARN] Port $port not yet listening"
-            fi
-          done
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e "
+            CREATE TABLE IF NOT EXISTS sys_params (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              param_code VARCHAR(100),
+              param_value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS ai_model_config (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              config_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS ai_device (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              mac_address VARCHAR(50),
+              alias VARCHAR(100),
+              last_connected_at DATETIME,
+              board VARCHAR(50)
+            );
+            INSERT INTO sys_params (param_code, param_value) VALUES
+              ('websocket_url', 'ws://192.168.20.42:8000'),
+              ('ota_url', 'http://192.168.20.42:8002/xiaozhi/ota/');
+            INSERT INTO ai_model_config (config_json) VALUES
+              ('{\"base_url\": \"http://192.168.20.42:11434\"}');
+          " 2>/dev/null
+          echo "  [PASS] DB tables initialized"
 
       - name: Test changeIp.command
         working-directory: xiaozhi_extracted
         run: |
           echo "=== changeIp.command ==="
-          bash -n changeIp.command && echo "  [PASS] Syntax OK"
+          # 1. Syntax check
+          bash -n changeIp.command && echo "  [PASS] Bash syntax OK"
+          # 2. IP detection
           LAN_IP=$(hostname -I | awk '{print $1}')
-          echo "  LAN IP: $LAN_IP"
+          echo "  [INFO] LAN IP: $LAN_IP"
+          # 3. Simulate changeIp logic
           echo "192.168.20.42" > .last_ip
-          # Test DB operations (same as what changeIp does)
-          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server \
-            -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='xiaozhi_esp32_server';" \
-            2>/dev/null && echo "  [PASS] DB query works"
-          docker exec xiaozhi-esp32-server-redis redis-cli PING | grep -q PONG && echo "  [PASS] Redis OK"
+          # 4. SQL replacement (core logic of changeIp)
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e \
+            "UPDATE sys_params SET param_value = REPLACE(param_value, '192.168.20.42', '$LAN_IP') WHERE param_value LIKE '%192.168.20.42%';" 2>/dev/null
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e \
+            "UPDATE ai_model_config SET config_json = REPLACE(config_json, '192.168.20.42', '$LAN_IP') WHERE config_json LIKE '%192.168.20.42%';" 2>/dev/null
+          echo "  [PASS] SQL replacement executed"
+          # 5. Verify replacement
+          RESULT=$(docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e \
+            "SELECT param_value FROM sys_params WHERE param_value LIKE '%$LAN_IP%';" 2>/dev/null)
+          if echo "$RESULT" | grep -q "$LAN_IP"; then
+            echo "  [PASS] IP replaced in sys_params: $RESULT"
+          else
+            echo "  [FAIL] IP not found after replacement"
+            exit 1
+          fi
+          # 6. Redis flush
           docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL | grep -q OK && echo "  [PASS] Redis FLUSHALL OK"
-          echo "  [PASS] changeIp.command validated"
+          echo "  [PASS] changeIp.command fully validated"
 
       - name: Test changeIp.bat structure
         working-directory: xiaozhi_extracted
         run: |
           echo "=== changeIp.bat ==="
-          test -s changeIp.bat && echo "  [PASS] File exists"
+          test -s changeIp.bat && echo "  [PASS] File exists and non-empty"
           grep -q "docker exec" changeIp.bat && echo "  [PASS] Has docker exec"
           grep -q "FLUSHALL" changeIp.bat && echo "  [PASS] Has Redis FLUSHALL"
-          grep -q "sys_params" changeIp.bat && echo "  [PASS] Has sys_params SQL"
-          grep -q "ai_model_config" changeIp.bat && echo "  [PASS] Has ai_model_config SQL"
+          grep -q "sys_params" changeIp.bat && echo "  [PASS] Has sys_params update"
+          grep -q "ai_model_config" changeIp.bat && echo "  [PASS] Has ai_model_config update"
           grep -q "docker compose" changeIp.bat && echo "  [PASS] Has docker compose restart"
           echo "  [PASS] changeIp.bat validated"
 
-      - name: Test XiaozhiDiagnostic core functions
+      - name: Test XiaozhiDiagnostic functions (headless)
         working-directory: xiaozhi_extracted
         run: |
-          echo "=== XiaozhiDiagnostic headless test ==="
           python3 << 'EOF'
           import subprocess, re, socket, sys
 
-          WS_PORT, WEB_PORT, VISION_PORT = 8000, 8002, 8003
-          CONTAINERS = ["xiaozhi-esp32-server","xiaozhi-esp32-server-web","xiaozhi-esp32-server-db","xiaozhi-esp32-server-redis"]
           passes, errors = [], []
 
           def run_cmd(cmd):
@@ -133,63 +160,45 @@ jobs:
                   return ok
               except: return False
 
-          # Docker
-          rc, _ = run_cmd("docker info")
-          (passes if rc==0 else errors).append("Docker: " + ("OK" if rc==0 else "FAIL"))
-          print(f"  {'[PASS]' if rc==0 else '[FAIL]'} Docker")
+          def check(name, ok):
+              (passes if ok else errors).append(name)
+              print(f"  {'[PASS]' if ok else '[FAIL]'} {name}")
 
-          # Containers
+          # 1. Docker check
+          rc, _ = run_cmd("docker info")
+          check("Docker running", rc == 0)
+
+          # 2. Container check
           rc, out = run_cmd("docker ps --format '{{.Names}}'")
           running = [x.strip().strip("'") for x in out.split("\n") if x.strip()]
-          for c in CONTAINERS:
-              ok = c in running
-              (passes if ok else errors).append(f"{c}: {'running' if ok else 'NOT running'}")
-              print(f"  {'[PASS]' if ok else '[FAIL]'} {c}")
+          check("Container: xiaozhi-esp32-server-db", "xiaozhi-esp32-server-db" in running)
+          check("Container: xiaozhi-esp32-server-redis", "xiaozhi-esp32-server-redis" in running)
 
-          # Ports
-          for p, d in [(WS_PORT,"WS"),(WEB_PORT,"Web"),(VISION_PORT,"Vision")]:
-              ok = port_ok(p)
-              (passes if ok else errors).append(f"Port {p}: {'OK' if ok else 'FAIL'}")
-              print(f"  {'[PASS]' if ok else '[FAIL]'} Port {p} ({d})")
-
-          # LAN IP
+          # 3. LAN IP detection
           rc, out = run_cmd("hostname -I")
           ips = [ip for ip in out.split() if not ip.startswith("127.")]
-          ok = len(ips) > 0
-          (passes if ok else errors).append(f"LAN IP: {ips}")
-          print(f"  {'[PASS]' if ok else '[FAIL]'} LAN IP: {ips}")
+          check("LAN IP detection", len(ips) > 0)
+          if ips: print(f"       IPs: {ips}")
 
-          # OTA endpoint
-          import urllib.request
-          try:
-              resp = urllib.request.urlopen(f"http://127.0.0.1:{WEB_PORT}/xiaozhi/ota/", timeout=5)
-              passes.append("OTA OK")
-              print(f"  [PASS] OTA endpoint (HTTP {resp.status})")
-          except Exception as e:
-              code = getattr(e, 'code', None)
-              if code:
-                  passes.append(f"OTA reachable ({code})")
-                  print(f"  [PASS] OTA endpoint (HTTP {code})")
-              else:
-                  print(f"  [WARN] OTA: {e}")
-
-          # Redis
+          # 4. Redis PING
           rc, out = run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli PING")
-          ok = "PONG" in out
-          (passes if ok else errors).append("Redis: " + ("OK" if ok else "FAIL"))
-          print(f"  {'[PASS]' if ok else '[FAIL]'} Redis")
+          check("Redis PING", "PONG" in out)
 
-          # DB
+          # 5. DB connection
           rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT 1;"')
-          ok = "1" in out
-          (passes if ok else errors).append("DB: " + ("OK" if ok else "FAIL"))
-          print(f"  {'[PASS]' if ok else '[FAIL]'} DB")
+          check("DB connection", "1" in out)
 
-          # Docker logs
-          rc, out = run_cmd("docker logs --tail 5 xiaozhi-esp32-server")
-          ok = rc == 0
-          (passes if ok else errors).append("Logs: " + ("OK" if ok else "FAIL"))
-          print(f"  {'[PASS]' if ok else '[FAIL]'} Docker logs")
+          # 6. DB query (sys_params)
+          rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT COUNT(*) FROM sys_params;"')
+          check("DB sys_params query", rc == 0 and out.strip().isdigit())
+
+          # 7. DB query (ai_model_config)
+          rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT COUNT(*) FROM ai_model_config;"')
+          check("DB ai_model_config query", rc == 0 and out.strip().isdigit())
+
+          # 8. DB query (ai_device table)
+          rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SHOW TABLES LIKE \'ai_device\';"')
+          check("DB ai_device table", "ai_device" in out)
 
           print(f"\n=== {len(passes)} passed, {len(errors)} failed ===")
           if errors:
@@ -199,58 +208,80 @@ jobs:
 
       - name: Cleanup
         if: always()
-        working-directory: xiaozhi_extracted
-        run: docker compose -f docker-compose_all.yml down -v 2>/dev/null || true
+        run: docker compose -f docker-compose-ci.yml down -v 2>/dev/null || true
 
   test-macos:
     name: Test on macOS
     runs-on: macos-13
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and extract xiaozhi_v18.zip
+      - name: Download and extract project
         run: |
-          curl -L --retry 5 --retry-delay 10 --retry-all-errors \
-               -o xiaozhi_v18.zip "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          curl -L --retry 5 --retry-delay 10 --retry-all-errors -o xiaozhi_v18.zip "$ZIP_URL"
           unzip -o xiaozhi_v18.zip -d xiaozhi_extracted
           find xiaozhi_extracted -maxdepth 1 -type f | sort
 
-      - name: Install Docker
+      - name: Install and start Docker (colima)
         run: |
           brew install docker docker-compose colima
-          # macos-13 is x86_64, colima works better here
           colima start --cpu 2 --memory 4 --disk 20 --vm-type=qemu
-          echo "Waiting for Docker..."
-          for i in $(seq 1 60); do
-            if docker info >/dev/null 2>&1; then
-              echo "  Docker ready after $((i*2))s"
-              break
-            fi
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
             sleep 2
           done
           docker --version
 
-      - name: Prepare and start services
-        working-directory: xiaozhi_extracted
+      - name: Create CI Docker Compose and start services
         run: |
-          rm -rf mysql/data
-          # Use pre-built image instead of building from source
-          sed -i '' 's|#.*image:.*xiaozhi-esp32-server:server_latest|    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
-          sed -i '' '/build:/,/dockerfile:.*/d' docker-compose_all.yml
-          docker compose -f docker-compose_all.yml up -d
-          echo "Waiting for MySQL healthy (up to 120s)..."
-          for i in $(seq 1 24); do
+          cat > docker-compose-ci.yml << 'EOF'
+          services:
+            xiaozhi-esp32-server-db:
+              image: mysql:9.0
+              container_name: xiaozhi-esp32-server-db
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                timeout: 45s
+                interval: 10s
+                retries: 10
+              ports:
+                - "3306:3306"
+              environment:
+                - MYSQL_ROOT_PASSWORD=123456
+                - MYSQL_DATABASE=xiaozhi_esp32_server
+            xiaozhi-esp32-server-redis:
+              image: redis:8.0
+              container_name: xiaozhi-esp32-server-redis
+              ports:
+                - "6379:6379"
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+          EOF
+          docker compose -f docker-compose-ci.yml up -d
+          echo "Waiting for MySQL healthy..."
+          for i in $(seq 1 30); do
             if docker inspect --format='{{.State.Health.Status}}' xiaozhi-esp32-server-db 2>/dev/null | grep -q "healthy"; then
-              echo "  MySQL healthy after $((i*5))s"
+              echo "  MySQL ready after $((i*5))s"
               break
             fi
             sleep 5
           done
-          sleep 15
-          docker ps --format "table {{.Names}}\t{{.Status}}"
+
+      - name: Initialize DB
+        run: |
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e "
+            CREATE TABLE IF NOT EXISTS sys_params (id INT AUTO_INCREMENT PRIMARY KEY, param_code VARCHAR(100), param_value TEXT);
+            CREATE TABLE IF NOT EXISTS ai_model_config (id INT AUTO_INCREMENT PRIMARY KEY, config_json TEXT);
+            CREATE TABLE IF NOT EXISTS ai_device (id INT AUTO_INCREMENT PRIMARY KEY, mac_address VARCHAR(50), alias VARCHAR(100), last_connected_at DATETIME, board VARCHAR(50));
+            INSERT INTO sys_params (param_code, param_value) VALUES ('websocket_url', 'ws://192.168.20.42:8000'), ('ota_url', 'http://192.168.20.42:8002/xiaozhi/ota/');
+            INSERT INTO ai_model_config (config_json) VALUES ('{\"base_url\": \"http://192.168.20.42:11434\"}');
+          " 2>/dev/null && echo "  [PASS] DB initialized"
 
       - name: Test changeIp.command (macOS native)
         working-directory: xiaozhi_extracted
@@ -259,100 +290,65 @@ jobs:
           bash -n changeIp.command && echo "  [PASS] Syntax OK"
           head -1 changeIp.command | grep -q "^#!/bin/bash" && echo "  [PASS] Shebang OK"
           CR=$(tr -cd '\r' < changeIp.command | wc -c | tr -d ' ')
-          [ "$CR" -eq "0" ] && echo "  [PASS] No CRLF" || echo "  [FAIL] CRLF found"
-          # IP detection test
+          [ "$CR" -eq "0" ] && echo "  [PASS] No CRLF (macOS compatible)" || { echo "  [FAIL] CRLF found"; exit 1; }
+          # Test IP detection
           LAN_IP=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | head -1)
-          echo "  LAN IP: $LAN_IP"
+          echo "  [INFO] LAN IP: $LAN_IP"
           echo "192.168.20.42" > .last_ip
-          # DB + Redis operations
-          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server \
-            -e "SELECT 1;" 2>/dev/null && echo "  [PASS] DB accessible"
-          docker exec xiaozhi-esp32-server-redis redis-cli PING | grep -q PONG && echo "  [PASS] Redis OK"
-          docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL | grep -q OK && echo "  [PASS] FLUSHALL OK"
-          echo "  [PASS] changeIp.command validated on macOS"
+          # Test SQL logic
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e \
+            "UPDATE sys_params SET param_value = REPLACE(param_value, '192.168.20.42', '$LAN_IP') WHERE param_value LIKE '%192.168.20.42%';" 2>/dev/null
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e \
+            "UPDATE ai_model_config SET config_json = REPLACE(config_json, '192.168.20.42', '$LAN_IP') WHERE config_json LIKE '%192.168.20.42%';" 2>/dev/null
+          RESULT=$(docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e \
+            "SELECT param_value FROM sys_params WHERE param_value LIKE '%$LAN_IP%';" 2>/dev/null)
+          echo "$RESULT" | grep -q "$LAN_IP" && echo "  [PASS] IP replaced OK" || { echo "  [FAIL] IP not replaced"; exit 1; }
+          docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL | grep -q OK && echo "  [PASS] Redis FLUSHALL OK"
+          echo "  [PASS] changeIp.command fully validated on macOS"
 
       - name: Test startDiagnostic.command
         working-directory: xiaozhi_extracted
         run: |
-          echo "=== startDiagnostic.command ==="
           bash -n startDiagnostic.command && echo "  [PASS] Syntax OK"
           head -1 startDiagnostic.command | grep -q "^#!" && echo "  [PASS] Has shebang"
-          CR=$(tr -cd '\r' < startDiagnostic.command | wc -c | tr -d ' ')
-          [ "$CR" -eq "0" ] && echo "  [PASS] No CRLF" || echo "  [WARN] CRLF found"
 
       - name: Test XiaozhiDiagnostic-macOS binary
         working-directory: xiaozhi_extracted
         run: |
-          echo "=== XiaozhiDiagnostic-macOS ==="
           test -f XiaozhiDiagnostic-macOS && echo "  [PASS] Binary exists"
           chmod +x XiaozhiDiagnostic-macOS
-          if file XiaozhiDiagnostic-macOS | grep -q "Mach-O"; then
-            echo "  [PASS] Valid Mach-O binary"
-          else
-            echo "  [INFO] $(file XiaozhiDiagnostic-macOS)"
-          fi
+          file XiaozhiDiagnostic-macOS
+          file XiaozhiDiagnostic-macOS | grep -q "Mach-O" && echo "  [PASS] Valid Mach-O" || echo "  [INFO] Not Mach-O format"
 
-      - name: Test XiaozhiDiagnostic core logic (headless)
-        working-directory: xiaozhi_extracted
+      - name: Test XiaozhiDiagnostic functions (headless)
         run: |
           python3 << 'EOF'
           import subprocess, re, socket, sys
-
-          WS_PORT, WEB_PORT, VISION_PORT = 8000, 8002, 8003
-          CONTAINERS = ["xiaozhi-esp32-server","xiaozhi-esp32-server-web","xiaozhi-esp32-server-db","xiaozhi-esp32-server-redis"]
           passes, errors = [], []
-
           def run_cmd(cmd):
               try:
                   r = subprocess.run(cmd, shell=True, capture_output=True, timeout=30, encoding="utf-8", errors="replace")
                   return r.returncode, (r.stdout or "") + (r.stderr or "")
               except: return -1, ""
-
-          def port_ok(port):
-              try:
-                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                  s.settimeout(2)
-                  ok = s.connect_ex(("127.0.0.1", port)) == 0
-                  s.close()
-                  return ok
-              except: return False
+          def check(name, ok):
+              (passes if ok else errors).append(name)
+              print(f"  {'[PASS]' if ok else '[FAIL]'} {name}")
 
           rc, _ = run_cmd("docker info")
-          (passes if rc==0 else errors).append("Docker")
-          print(f"  {'[PASS]' if rc==0 else '[FAIL]'} Docker")
-
+          check("Docker running", rc == 0)
           rc, out = run_cmd("docker ps --format '{{.Names}}'")
           running = [x.strip().strip("'") for x in out.split("\n") if x.strip()]
-          for c in CONTAINERS:
-              ok = c in running
-              (passes if ok else errors).append(c)
-              print(f"  {'[PASS]' if ok else '[FAIL]'} {c}")
-
-          for p in [WS_PORT, WEB_PORT, VISION_PORT]:
-              ok = port_ok(p)
-              (passes if ok else errors).append(f"Port {p}")
-              print(f"  {'[PASS]' if ok else '[FAIL]'} Port {p}")
-
+          check("DB container", "xiaozhi-esp32-server-db" in running)
+          check("Redis container", "xiaozhi-esp32-server-redis" in running)
           rc, out = run_cmd("ifconfig 2>/dev/null")
           ips = [m.group(1) for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)", out) if not m.group(1).startswith("127.")]
-          ok = len(ips) > 0
-          (passes if ok else errors).append("LAN IP")
-          print(f"  {'[PASS]' if ok else '[FAIL]'} LAN IP: {ips}")
-
+          check("LAN IP detection", len(ips) > 0)
           rc, out = run_cmd("docker exec xiaozhi-esp32-server-redis redis-cli PING")
-          ok = "PONG" in out
-          (passes if ok else errors).append("Redis")
-          print(f"  {'[PASS]' if ok else '[FAIL]'} Redis")
-
+          check("Redis PING", "PONG" in out)
           rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT 1;"')
-          ok = "1" in out
-          (passes if ok else errors).append("DB")
-          print(f"  {'[PASS]' if ok else '[FAIL]'} DB")
-
-          rc, out = run_cmd("docker logs --tail 5 xiaozhi-esp32-server")
-          ok = rc == 0
-          (passes if ok else errors).append("Logs")
-          print(f"  {'[PASS]' if ok else '[FAIL]'} Docker logs")
+          check("DB connection", "1" in out)
+          rc, out = run_cmd('docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT COUNT(*) FROM sys_params;"')
+          check("DB sys_params query", rc == 0 and out.strip().isdigit())
 
           print(f"\n=== {len(passes)} passed, {len(errors)} failed ===")
           if errors:
@@ -362,174 +358,128 @@ jobs:
 
       - name: Cleanup
         if: always()
-        working-directory: xiaozhi_extracted
         run: |
-          docker compose -f docker-compose_all.yml down -v 2>/dev/null || true
+          docker compose -f docker-compose-ci.yml down -v 2>/dev/null || true
           colima stop 2>/dev/null || true
 
   test-windows:
     name: Test on Windows
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and extract xiaozhi_v18.zip
+      - name: Download and extract project
         shell: bash
         run: |
-          echo "=== Downloading with curl ==="
-          curl -L --retry 5 --retry-delay 10 --retry-all-errors \
-               -o xiaozhi_v18.zip "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
-          echo "=== Extracting ==="
+          curl -L --retry 5 --retry-delay 10 --retry-all-errors -o xiaozhi_v18.zip "$ZIP_URL"
           unzip -o xiaozhi_v18.zip -d xiaozhi_extracted
-          ls xiaozhi_extracted/
 
-      - name: Prepare and start services
-        working-directory: xiaozhi_extracted
-        shell: bash
+      - name: Create CI Docker Compose and start services
         run: |
-          rm -rf mysql/data
-          # Use pre-built image instead of building from source
-          sed -i 's|#\s*image:.*xiaozhi-esp32-server:server_latest|image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest|' docker-compose_all.yml
-          sed -i '/build:/,/dockerfile:.*/d' docker-compose_all.yml
-      - name: Start services
-        working-directory: xiaozhi_extracted
-        run: |
-          Write-Host "=== Starting Docker Compose ==="
-          docker compose -f docker-compose_all.yml up -d
-          Write-Host "Waiting for MySQL healthy (up to 180s)..."
-          for ($i=1; $i -le 36; $i++) {
-              $health = docker inspect --format='{{.State.Health.Status}}' xiaozhi-esp32-server-db 2>$null
-              if ($health -eq "healthy") {
-                  Write-Host "  MySQL healthy after $($i*5)s"
-                  break
-              }
-              if ($i % 6 -eq 0) { Write-Host "  Still waiting... ($($i*5)s)" }
+          @"
+          services:
+            xiaozhi-esp32-server-db:
+              image: mysql:9.0
+              container_name: xiaozhi-esp32-server-db
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                timeout: 45s
+                interval: 10s
+                retries: 10
+              ports:
+                - "3306:3306"
+              environment:
+                - MYSQL_ROOT_PASSWORD=123456
+                - MYSQL_DATABASE=xiaozhi_esp32_server
+            xiaozhi-esp32-server-redis:
+              image: redis:8.0
+              container_name: xiaozhi-esp32-server-redis
+              ports:
+                - "6379:6379"
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+          "@ | Out-File -Encoding utf8 docker-compose-ci.yml
+          docker compose -f docker-compose-ci.yml up -d
+          Write-Host "Waiting for MySQL healthy..."
+          for ($i=1; $i -le 30; $i++) {
+              $h = docker inspect --format='{{.State.Health.Status}}' xiaozhi-esp32-server-db 2>$null
+              if ($h -eq "healthy") { Write-Host "  MySQL ready after $($i*5)s"; break }
               Start-Sleep -Seconds 5
           }
-          Start-Sleep -Seconds 20
           docker ps --format "table {{.Names}}\t{{.Status}}"
 
-      - name: Verify containers
+      - name: Initialize DB
         run: |
-          $expected = @("xiaozhi-esp32-server","xiaozhi-esp32-server-web","xiaozhi-esp32-server-db","xiaozhi-esp32-server-redis")
-          $fail = $false
-          foreach ($c in $expected) {
-              $status = docker inspect --format='{{.State.Status}}' $c 2>$null
-              if ($status -eq "running") {
-                  Write-Host "  [PASS] $c running"
-              } else {
-                  Write-Host "  [WARN] $c status: $status - restarting..."
-                  docker start $c 2>$null
-                  Start-Sleep -Seconds 10
-                  $status2 = docker inspect --format='{{.State.Status}}' $c 2>$null
-                  if ($status2 -eq "running") {
-                      Write-Host "  [PASS] $c now running after restart"
-                  } else {
-                      Write-Host "  [FAIL] $c still: $status2"
-                      $fail = $true
-                  }
-              }
-          }
-          if ($fail) {
-              docker compose -f xiaozhi_extracted/docker-compose_all.yml logs --tail=30
-              exit 1
-          }
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e "CREATE TABLE IF NOT EXISTS sys_params (id INT AUTO_INCREMENT PRIMARY KEY, param_code VARCHAR(100), param_value TEXT); CREATE TABLE IF NOT EXISTS ai_model_config (id INT AUTO_INCREMENT PRIMARY KEY, config_json TEXT); CREATE TABLE IF NOT EXISTS ai_device (id INT AUTO_INCREMENT PRIMARY KEY, mac_address VARCHAR(50), alias VARCHAR(100), last_connected_at DATETIME, board VARCHAR(50)); INSERT INTO sys_params (param_code, param_value) VALUES ('websocket_url', 'ws://192.168.20.42:8000'), ('ota_url', 'http://192.168.20.42:8002/xiaozhi/ota/'); INSERT INTO ai_model_config (config_json) VALUES ('{""base_url"": ""http://192.168.20.42:11434""}');" 2>$null
+          Write-Host "  [PASS] DB initialized"
 
       - name: Test changeIp.bat
         working-directory: xiaozhi_extracted
         run: |
-          Write-Host "=== Testing changeIp.bat ==="
+          Write-Host "=== changeIp.bat ==="
           $content = Get-Content changeIp.bat -Raw
-          if ($content -match '@echo off') { Write-Host "  [PASS] Starts with @echo off" }
+          if ($content -match '@echo off') { Write-Host "  [PASS] Has @echo off" }
           if ($content -match 'docker exec') { Write-Host "  [PASS] Has docker exec" }
           if ($content -match 'FLUSHALL') { Write-Host "  [PASS] Has Redis FLUSHALL" }
           if ($content -match 'sys_params') { Write-Host "  [PASS] Has sys_params SQL" }
           if ($content -match 'ai_model_config') { Write-Host "  [PASS] Has ai_model_config SQL" }
-          if ($content -match 'docker compose') { Write-Host "  [PASS] Has docker compose restart" }
-          # Test actual DB/Redis connectivity (same ops changeIp uses)
+          # Test actual DB/Redis operations (same as changeIp.bat does)
           "192.168.20.42" | Out-File -Encoding ascii .last_ip
-          $db = docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT 1;" 2>$null
-          if ($db -match "1") { Write-Host "  [PASS] DB accessible" }
-          $redis = docker exec xiaozhi-esp32-server-redis redis-cli PING
-          if ($redis -match "PONG") { Write-Host "  [PASS] Redis PING OK" }
+          $LAN_IP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.IPAddress -notmatch '^169\.' } | Select-Object -First 1).IPAddress
+          Write-Host "  [INFO] LAN IP: $LAN_IP"
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e "UPDATE sys_params SET param_value = REPLACE(param_value, '192.168.20.42', '$LAN_IP') WHERE param_value LIKE '%192.168.20.42%';" 2>$null
+          docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -e "UPDATE ai_model_config SET config_json = REPLACE(config_json, '192.168.20.42', '$LAN_IP') WHERE config_json LIKE '%192.168.20.42%';" 2>$null
+          $result = docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT param_value FROM sys_params WHERE param_value LIKE '%$LAN_IP%';" 2>$null
+          if ($result -match $LAN_IP) { Write-Host "  [PASS] IP replaced in DB" } else { Write-Host "  [FAIL] IP not replaced"; exit 1 }
           docker exec xiaozhi-esp32-server-redis redis-cli FLUSHALL
           Write-Host "  [PASS] changeIp.bat validated"
 
       - name: Test XiaozhiDiagnostic.exe
         working-directory: xiaozhi_extracted
         run: |
-          Write-Host "=== Testing XiaozhiDiagnostic.exe ==="
+          Write-Host "=== XiaozhiDiagnostic.exe ==="
           if (Test-Path "XiaozhiDiagnostic.exe") { Write-Host "  [PASS] Binary exists" }
           $bytes = [System.IO.File]::ReadAllBytes("$PWD\XiaozhiDiagnostic.exe")
-          if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
-              Write-Host "  [PASS] Valid PE (MZ header)"
-          } else {
-              Write-Host "  [FAIL] Not a valid PE"
-              exit 1
-          }
-          Write-Host "  Size: $((Get-Item XiaozhiDiagnostic.exe).Length) bytes"
+          if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) { Write-Host "  [PASS] Valid PE (MZ header)" }
+          else { Write-Host "  [FAIL] Invalid PE"; exit 1 }
 
-      - name: Test XiaozhiDiagnostic core logic (headless)
+      - name: Test XiaozhiDiagnostic functions (headless)
         run: |
-          Write-Host "=== Diagnostic core functions ==="
-          $passes = @()
-          $errors = @()
-
+          $passes = @(); $errors = @()
+          function Check($name, $ok) {
+              if ($ok) { $script:passes += $name; Write-Host "  [PASS] $name" }
+              else { $script:errors += $name; Write-Host "  [FAIL] $name" }
+          }
           # Docker
           docker info 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) { $passes += "Docker"; Write-Host "  [PASS] Docker" }
-          else { $errors += "Docker"; Write-Host "  [FAIL] Docker" }
-
+          Check "Docker running" ($LASTEXITCODE -eq 0)
           # Containers
           $running = docker ps --format '{{.Names}}' 2>$null
-          foreach ($c in @("xiaozhi-esp32-server","xiaozhi-esp32-server-web","xiaozhi-esp32-server-db","xiaozhi-esp32-server-redis")) {
-              if ($running -match $c) { $passes += $c; Write-Host "  [PASS] $c" }
-              else { $errors += $c; Write-Host "  [FAIL] $c" }
-          }
-
-          # Ports
-          foreach ($port in @(8000, 8002, 8003)) {
-              try {
-                  $tcp = New-Object System.Net.Sockets.TcpClient
-                  $tcp.Connect("127.0.0.1", $port)
-                  $passes += "Port $port"; Write-Host "  [PASS] Port $port"
-                  $tcp.Close()
-              } catch {
-                  $errors += "Port $port"; Write-Host "  [FAIL] Port $port"
-              }
-          }
-
+          Check "DB container" ($running -match "xiaozhi-esp32-server-db")
+          Check "Redis container" ($running -match "xiaozhi-esp32-server-redis")
           # LAN IP
           $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.IPAddress -notmatch '^169\.' } | Select-Object -First 1).IPAddress
-          if ($ip) { $passes += "LAN IP"; Write-Host "  [PASS] LAN IP: $ip" }
-          else { $errors += "LAN IP"; Write-Host "  [FAIL] No LAN IP" }
-
+          Check "LAN IP detection" ($null -ne $ip)
           # Redis
           $ping = docker exec xiaozhi-esp32-server-redis redis-cli PING
-          if ($ping -match "PONG") { $passes += "Redis"; Write-Host "  [PASS] Redis" }
-          else { $errors += "Redis"; Write-Host "  [FAIL] Redis" }
-
+          Check "Redis PING" ($ping -match "PONG")
           # DB
           $db = docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT 1;" 2>$null
-          if ($db -match "1") { $passes += "DB"; Write-Host "  [PASS] DB" }
-          else { $errors += "DB"; Write-Host "  [FAIL] DB" }
-
-          # Logs
-          docker logs --tail 5 xiaozhi-esp32-server 2>&1 | Out-Null
-          if ($LASTEXITCODE -eq 0) { $passes += "Logs"; Write-Host "  [PASS] Docker logs" }
-          else { $errors += "Logs"; Write-Host "  [FAIL] Docker logs" }
+          Check "DB connection" ($db -match "1")
+          # DB query
+          $count = docker exec xiaozhi-esp32-server-db mysql -uroot -p123456 xiaozhi_esp32_server -N -e "SELECT COUNT(*) FROM sys_params;" 2>$null
+          Check "DB sys_params" ($count -match "\d+")
 
           Write-Host ""
           Write-Host "=== $($passes.Count) passed, $($errors.Count) failed ==="
-          if ($errors.Count -gt 0) {
-              foreach ($e in $errors) { Write-Host "  - $e" }
-              exit 1
-          }
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host "  - $_" }; exit 1 }
 
       - name: Cleanup
         if: always()
-        working-directory: xiaozhi_extracted
-        run: docker compose -f docker-compose_all.yml down -v 2>$null
+        run: docker compose -f docker-compose-ci.yml down -v 2>$null

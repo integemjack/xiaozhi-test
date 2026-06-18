@@ -400,7 +400,29 @@ jobs:
       - name: Download xiaozhi_v18.zip
         run: |
           Write-Host "=== Downloading xiaozhi_v18.zip ==="
-          Invoke-WebRequest -Uri "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip" -OutFile "xiaozhi_v18.zip"
+          $maxRetries = 3
+          $retryCount = 0
+          $success = $false
+          while (-not $success -and $retryCount -lt $maxRetries) {
+              try {
+                  $retryCount++
+                  Write-Host "Attempt $retryCount of $maxRetries..."
+                  $ProgressPreference = 'SilentlyContinue'
+                  Invoke-WebRequest -Uri "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip" -OutFile "xiaozhi_v18.zip" -TimeoutSec 300
+                  $success = $true
+              } catch {
+                  Write-Host "  Download failed: $_"
+                  if ($retryCount -lt $maxRetries) {
+                      Write-Host "  Retrying in 10 seconds..."
+                      Start-Sleep -Seconds 10
+                  }
+              }
+          }
+          if (-not $success) {
+              # Fallback: try curl
+              Write-Host "PowerShell download failed, trying curl..."
+              curl.exe -L --retry 3 --retry-delay 5 -o "xiaozhi_v18.zip" "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          }
           Get-Item "xiaozhi_v18.zip" | Select-Object Name, Length
 
       - name: Extract ZIP file

@@ -185,6 +185,203 @@ jobs:
           echo ""
           echo "=== END SUMMARY ==="
 
+  test-scripts-macos:
+    name: Test Scripts on macOS
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download xiaozhi_v18.zip
+        run: |
+          echo "=== Downloading xiaozhi_v18.zip ==="
+          curl -L -o xiaozhi_v18.zip "https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          ls -lh xiaozhi_v18.zip
+
+      - name: Extract ZIP file
+        run: |
+          echo "=== Extracting xiaozhi_v18.zip ==="
+          unzip -o xiaozhi_v18.zip -d xiaozhi_extracted
+          echo ""
+          echo "=== Extracted file structure ==="
+          find xiaozhi_extracted -type f | head -100
+          echo ""
+          echo "=== Total files extracted ==="
+          find xiaozhi_extracted -type f | wc -l
+
+      - name: List all script files
+        run: |
+          echo "=== Finding all script files ==="
+          echo ""
+          echo "--- Batch files (.bat) ---"
+          find xiaozhi_extracted -name "*.bat" -type f
+          echo ""
+          echo "--- Shell scripts (.sh / .command) ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f
+          echo ""
+          echo "--- Python scripts (.py) ---"
+          find xiaozhi_extracted -name "*.py" -type f
+          echo ""
+          echo "--- YAML config files ---"
+          find xiaozhi_extracted \( -name "*.yml" -o -name "*.yaml" \) -type f
+          echo ""
+          echo "--- Dockerfiles ---"
+          find xiaozhi_extracted -name "Dockerfile*" -type f
+
+      - name: Validate YAML files
+        run: |
+          echo "=== Validating YAML files ==="
+          pip3 install pyyaml
+          find xiaozhi_extracted \( -name "*.yml" -o -name "*.yaml" \) -type f | while read f; do
+            echo "Checking: $f"
+            python3 -c "
+          import yaml, sys
+          try:
+              with open('$f', 'r', encoding='utf-8') as fh:
+                  yaml.safe_load(fh)
+              print('  [PASS] Valid YAML')
+          except Exception as e:
+              print(f'  [FAIL] {e}')
+              sys.exit(1)
+          " || echo "  [WARN] YAML validation failed for $f"
+          done
+          echo ""
+          echo "=== YAML validation complete ==="
+
+      - name: Check shell scripts syntax (macOS native)
+        run: |
+          echo "=== Checking shell scripts syntax on macOS ==="
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f | while read f; do
+            echo "Checking: $f"
+            # Try to detect shell type from shebang
+            SHEBANG=$(head -1 "$f" 2>/dev/null)
+            if echo "$SHEBANG" | grep -q "bash"; then
+              bash -n "$f" 2>&1 && echo "  [PASS] Valid bash syntax" || echo "  [FAIL] Bash syntax error"
+            elif echo "$SHEBANG" | grep -q "zsh"; then
+              zsh -n "$f" 2>&1 && echo "  [PASS] Valid zsh syntax" || echo "  [FAIL] Zsh syntax error"
+            elif echo "$SHEBANG" | grep -q "sh"; then
+              sh -n "$f" 2>&1 && echo "  [PASS] Valid sh syntax" || echo "  [FAIL] Sh syntax error"
+            else
+              # Default to bash on macOS
+              bash -n "$f" 2>&1 && echo "  [PASS] Valid bash syntax (default)" || echo "  [FAIL] Bash syntax error"
+            fi
+          done
+          echo ""
+          echo "=== Shell script syntax check complete ==="
+
+      - name: Test .command files are executable on macOS
+        run: |
+          echo "=== Testing .command files (macOS double-click scripts) ==="
+          find xiaozhi_extracted -name "*.command" -type f | while read f; do
+            echo "Checking: $f"
+            # Verify shebang line exists
+            SHEBANG=$(head -1 "$f" 2>/dev/null)
+            if echo "$SHEBANG" | grep -q "^#!"; then
+              echo "  [PASS] Has shebang: $SHEBANG"
+            else
+              echo "  [FAIL] Missing shebang line - won't execute on double-click"
+            fi
+            # Check for CRLF line endings (breaks macOS execution)
+            if grep -Pq '\r\n' "$f" 2>/dev/null || grep -c $'\r' "$f" > /dev/null 2>&1; then
+              CR_COUNT=$(tr -cd '\r' < "$f" | wc -c | tr -d ' ')
+              if [ "$CR_COUNT" -gt "0" ]; then
+                echo "  [FAIL] Contains Windows CRLF line endings ($CR_COUNT CR chars) - will fail on macOS"
+              else
+                echo "  [PASS] No CRLF issues"
+              fi
+            else
+              echo "  [PASS] No CRLF issues"
+            fi
+            # Check bash syntax
+            bash -n "$f" 2>&1 && echo "  [PASS] Valid bash syntax" || echo "  [FAIL] Bash syntax error"
+          done
+          echo ""
+          echo "=== .command file check complete ==="
+
+      - name: Check Python scripts syntax
+        run: |
+          echo "=== Checking Python scripts syntax ==="
+          find xiaozhi_extracted -name "*.py" -type f | while read f; do
+            echo "Checking: $f"
+            python3 -m py_compile "$f" 2>&1 && echo "  [PASS] Valid Python syntax" || echo "  [FAIL] Python syntax error"
+          done
+          echo ""
+          echo "=== Python script syntax check complete ==="
+
+      - name: Check Dockerfiles syntax
+        run: |
+          echo "=== Checking Dockerfiles ==="
+          # Install hadolint via brew
+          brew install hadolint 2>/dev/null || true
+          find xiaozhi_extracted -name "Dockerfile*" -type f | while read f; do
+            echo "Checking: $f"
+            hadolint --no-fail "$f" 2>&1 | head -20
+            echo "  [DONE] Dockerfile checked"
+          done
+          echo ""
+          echo "=== Dockerfile check complete ==="
+
+      - name: Validate Docker Compose files
+        run: |
+          echo "=== Validating Docker Compose files ==="
+          # Docker may not be available on macOS runners, use python validation
+          find xiaozhi_extracted \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" \) -type f | while read f; do
+            echo "Checking: $f"
+            python3 -c "
+          import yaml, sys
+          try:
+              with open('$f', 'r', encoding='utf-8') as fh:
+                  data = yaml.safe_load(fh)
+              if data and ('services' in data or 'version' in data):
+                  print('  [PASS] Valid Docker Compose structure')
+              else:
+                  print('  [WARN] Missing services/version key')
+          except Exception as e:
+              print(f'  [FAIL] {e}')
+              sys.exit(1)
+          " || echo "  [WARN] Docker Compose validation failed for $f"
+          done
+          echo ""
+          echo "=== Docker Compose validation complete ==="
+
+      - name: Check file permissions
+        run: |
+          echo "=== Checking file permissions for macOS ==="
+          echo ""
+          echo "--- Shell scripts without execute permission ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f ! -perm -111 | while read f; do
+            echo "  [WARN] Not executable: $f"
+          done
+          echo ""
+          echo "--- Files with Windows line endings (CRLF) ---"
+          find xiaozhi_extracted \( -name "*.sh" -o -name "*.command" \) -type f | while read f; do
+            CR_COUNT=$(tr -cd '\r' < "$f" | wc -c | tr -d ' ')
+            if [ "$CR_COUNT" -gt "0" ]; then
+              echo "  [WARN] CRLF detected: $f ($CR_COUNT CR chars)"
+            fi
+          done
+          echo ""
+          echo "=== Permission check complete ==="
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "=== TEST SUMMARY (macOS) ==="
+          echo ""
+          echo "Project: xiaozhi_v18"
+          echo "Source: https://creator.integem.com/wp-content/soft/xiaozhi_v18.zip"
+          echo ""
+          echo "Files analyzed:"
+          echo "  Total files:      $(find xiaozhi_extracted -type f | wc -l)"
+          echo "  Batch scripts:    $(find xiaozhi_extracted -name '*.bat' -type f | wc -l)"
+          echo "  Shell scripts:    $(find xiaozhi_extracted \( -name '*.sh' -o -name '*.command' \) -type f | wc -l)"
+          echo "  Python scripts:   $(find xiaozhi_extracted -name '*.py' -type f | wc -l)"
+          echo "  YAML configs:     $(find xiaozhi_extracted \( -name '*.yml' -o -name '*.yaml' \) -type f | wc -l)"
+          echo "  Dockerfiles:      $(find xiaozhi_extracted -name 'Dockerfile*' -type f | wc -l)"
+          echo ""
+          echo "=== END SUMMARY ==="
+
   test-scripts-windows:
     name: Test Scripts on Windows
     runs-on: windows-latest
